@@ -8,6 +8,8 @@ import sys
 from flask import Flask, request, jsonify
 from google.cloud import storage
 from google.cloud import bigquery
+from google import genai
+from google.genai import types
 
 # Configure logging to stdout
 logging.basicConfig(
@@ -23,10 +25,13 @@ app = Flask(__name__)
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT") # BQ Client will auto-detect if None
 DATASET_ID = os.environ.get("BIGQUERY_DATASET", "document_processing")
 TABLE_ID = os.environ.get("BIGQUERY_TABLE", "processed_documents")
+VERTEX_AI_LOCATION = os.environ.get("VERTEX_AI_LOCATION", os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"))
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 # Initialize GCP clients lazily
 storage_client = None
 bigquery_client = None
+genai_client = None
 
 def get_storage_client():
     global storage_client
@@ -39,6 +44,16 @@ def get_bigquery_client():
     if bigquery_client is None:
         bigquery_client = bigquery.Client()
     return bigquery_client
+
+def get_genai_client():
+    global genai_client
+    if genai_client is None:
+        genai_client = genai.Client(
+            vertexai=True,
+            project=PROJECT_ID,
+            location=VERTEX_AI_LOCATION,
+        )
+    return genai_client
 
 def extract_tags_and_count(text):
     """
@@ -74,12 +89,41 @@ def extract_tags_and_count(text):
         
     return word_count, list(tags)
 
+def extract_text_with_gemini(bucket_name, file_name, content_type):
+    """
+    Uses Gemini Flash on Vertex AI to extract readable text from a GCS object.
+    """
+    gcs_uri = f"gs://{bucket_name}/{file_name}"
+    mime_type = content_type or "application/octet-stream"
+    logger.info(f"Extracting text with Gemini Flash from {gcs_uri}")
+
+    try:
+        response = get_genai_client().models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                types.Part.from_uri(file_uri=gcs_uri, mime_type=mime_type),
+                (
+                    "Extract all readable text from this file. "
+                    "Return only the extracted text, with no summary or commentary."
+                ),
+            ],
+        )
+    except Exception as e:
+        logger.error(f"Gemini text extraction failed for {gcs_uri}: {e}")
+        raise
+
+    extracted_text = (getattr(response, "text", None) or "").strip()
+    if not extracted_text:
+        raise ValueError(f"Gemini returned no extracted text for {gcs_uri}")
+
+    return extracted_text
+
 @app.route("/", methods=["POST"])
 @app.route("/process", methods=["POST"])
 def process_document():
     """
     Receives Pub/Sub push messages, downloads the file from GCS,
-    performs simulated OCR / metadata extraction, and streams to BigQuery.
+    performs Gemini OCR / metadata extraction, and streams to BigQuery.
     """
     envelope = request.get_json()
     if not envelope:
@@ -127,50 +171,20 @@ def process_document():
 
         logger.info(f"Processing file: gs://{bucket_name}/{file_name} (Size: {size} bytes, ContentType: {content_type})")
 
-        # 2. Simulated OCR and metadata extraction logic
+        # 2. Gemini OCR and metadata extraction logic
         word_count = 0
         tags = []
         ocr_text_preview = ""
 
-        # Check if the file is a text file
-        if file_name.endswith(".txt") or "text/plain" in content_type:
-            try:
-                # Read content from GCS
-                gcs_client = get_storage_client()
-                bucket = gcs_client.bucket(bucket_name)
-                blob = bucket.blob(file_name)
-                
-                # Download as text (safely decoding)
-                content_bytes = blob.download_as_bytes()
-                file_content = content_bytes.decode("utf-8", errors="ignore")
-                
-                word_count, tags = extract_tags_and_count(file_content)
-                ocr_text_preview = file_content[:500]
-                logger.info(f"Successfully processed text file. Word count: {word_count}, Tags: {tags}")
-            except Exception as e:
-                logger.error(f"Failed to read file from GCS: {e}")
-                # Fail-fast: raise exception so we return 500 and trigger Pub/Sub retry
-                raise e
-        else:
-            # Simulate OCR for other file formats (e.g. PDF, Images)
-            logger.info("Non-text file detected. Performing simulated OCR metadata generation.")
-            # Basic rule-based simulation based on extension
-            ext = file_name.split(".")[-1].lower() if "." in file_name else "unknown"
-            word_count = hash(file_name) % 400 + 50 # deterministic mock word count
-            
-            # Simulated tags
-            tags = ["simulated", ext]
-            if "invoice" in file_name.lower() or "bill" in file_name.lower():
-                tags.append("invoice")
-            elif "report" in file_name.lower() or "annual" in file_name.lower():
-                tags.append("report")
-            else:
-                tags.append("document")
-            
-            ocr_text_preview = f"[Simulated OCR Preview for non-text file ({ext})]\n" \
-                               f"Filename: {file_name}\n" \
-                               f"Estimated Pages: {max(1, word_count // 150)}\n" \
-                               f"Detected text elements: invoice, date, total, company"
+        try:
+            extracted_text = extract_text_with_gemini(bucket_name, file_name, content_type)
+            word_count, tags = extract_tags_and_count(extracted_text)
+            ocr_text_preview = extracted_text[:500]
+            logger.info(f"Successfully extracted text with Gemini. Word count: {word_count}, Tags: {tags}")
+        except Exception as e:
+            logger.error(f"Failed to extract text from file: {e}")
+            # Fail-fast: return 500 so Pub/Sub retries delivery.
+            raise
 
         # 3. Stream Metadata to BigQuery
         bq_client = get_bigquery_client()

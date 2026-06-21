@@ -19,21 +19,17 @@ class TestLocalProcessor(unittest.TestCase):
         # Reset clients
         main.storage_client = None
         main.bigquery_client = None
+        main.genai_client = None
 
-    @patch('main.storage.Client')
+    @patch('main.genai.Client')
     @patch('main.bigquery.Client')
-    def test_process_txt_file(self, mock_bq_class, mock_storage_class):
+    def test_process_txt_file(self, mock_bq_class, mock_genai_class):
         # Setup mocks
-        mock_storage_client = MagicMock()
-        mock_storage_class.return_value = mock_storage_client
-        
-        mock_bucket = MagicMock()
-        mock_storage_client.bucket.return_value = mock_bucket
-        
-        mock_blob = MagicMock()
-        mock_bucket.blob.return_value = mock_blob
-        # Simulated content for text file
-        mock_blob.download_as_bytes.return_value = b"This is a confidential invoice for billing report and urgent priority items."
+        mock_genai_client = MagicMock()
+        mock_genai_class.return_value = mock_genai_client
+        mock_genai_response = MagicMock()
+        mock_genai_response.text = "This is a confidential invoice for billing report and urgent priority items."
+        mock_genai_client.models.generate_content.return_value = mock_genai_response
         
         mock_bq_client = MagicMock()
         mock_bq_class.return_value = mock_bq_client
@@ -69,10 +65,10 @@ class TestLocalProcessor(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data.decode(), "Success")
         
-        # Verify GCS download was called
-        mock_storage_client.bucket.assert_called_with("my-test-bucket")
-        mock_bucket.blob.assert_called_with("invoices/invoice_2026.txt")
-        mock_blob.download_as_bytes.assert_called_once()
+        # Verify Gemini extraction was called with the GCS object.
+        mock_genai_client.models.generate_content.assert_called_once()
+        _, generate_kwargs = mock_genai_client.models.generate_content.call_args
+        self.assertEqual(generate_kwargs["model"], main.GEMINI_MODEL)
         
         # Verify BQ insert was called
         mock_bq_client.insert_rows_json.assert_called_once()
@@ -98,12 +94,15 @@ class TestLocalProcessor(unittest.TestCase):
         self.assertIn("This is a confidential invoice", row["ocr_text_preview"])
         self.assertTrue(row["process_timestamp"].endswith("Z") or "+00:00" in row["process_timestamp"])
 
-    @patch('main.storage.Client')
+    @patch('main.genai.Client')
     @patch('main.bigquery.Client')
-    def test_process_binary_file_simulated_ocr(self, mock_bq_class, mock_storage_class):
+    def test_process_binary_file_gemini_ocr(self, mock_bq_class, mock_genai_class):
         # Setup mocks
-        mock_storage_client = MagicMock()
-        mock_storage_class.return_value = mock_storage_client
+        mock_genai_client = MagicMock()
+        mock_genai_class.return_value = mock_genai_client
+        mock_genai_response = MagicMock()
+        mock_genai_response.text = "Annual report final summary with revenue and confidential notes."
+        mock_genai_client.models.generate_content.return_value = mock_genai_response
         
         mock_bq_client = MagicMock()
         mock_bq_class.return_value = mock_bq_client
@@ -138,10 +137,10 @@ class TestLocalProcessor(unittest.TestCase):
         # Assertions
         self.assertEqual(response.status_code, 200)
         
-        # GCS client should NOT be called to download since it's a binary file (we simulate OCR based on path)
-        mock_storage_client.bucket.assert_not_called()
-        
-        # Verify BQ insert was called with simulated data
+        # Verify Gemini OCR was called with the uploaded GCS object.
+        mock_genai_client.models.generate_content.assert_called_once()
+
+        # Verify BQ insert was called with Gemini-derived data.
         mock_bq_client.insert_rows_json.assert_called_once()
         args, kwargs = mock_bq_client.insert_rows_json.call_args
         rows = args[1]
@@ -150,10 +149,9 @@ class TestLocalProcessor(unittest.TestCase):
         self.assertEqual(row["filename"], "annual_report.pdf")
         self.assertEqual(row["content_type"], "application/pdf")
         self.assertEqual(row["size"], 524288)
-        self.assertIn("simulated", row["tags"])
-        self.assertIn("pdf", row["tags"])
-        self.assertIn("report", row["tags"]) # annual_report has "report"
-        self.assertIn("[Simulated OCR Preview for non-text file (pdf)]", row["ocr_text_preview"])
+        self.assertIn("report", row["tags"])
+        self.assertIn("confidential", row["tags"])
+        self.assertIn("Annual report final summary", row["ocr_text_preview"])
 
     @patch('main.storage.Client')
     @patch('main.bigquery.Client')
@@ -185,13 +183,13 @@ class TestLocalProcessor(unittest.TestCase):
         mock_storage_class.assert_not_called()
         mock_bq_class.assert_not_called()
 
-    @patch('main.storage.Client')
+    @patch('main.genai.Client')
     @patch('main.bigquery.Client')
-    def test_internal_server_error_returns_500(self, mock_bq_class, mock_storage_class):
+    def test_internal_server_error_returns_500(self, mock_bq_class, mock_genai_class):
         # Setup mocks to raise exception
-        mock_storage_client = MagicMock()
-        mock_storage_class.return_value = mock_storage_client
-        mock_storage_client.bucket.side_effect = Exception("Storage connection error")
+        mock_genai_client = MagicMock()
+        mock_genai_class.return_value = mock_genai_client
+        mock_genai_client.models.generate_content.side_effect = Exception("Gemini extraction error")
 
         # Create Pub/Sub message envelope
         gcs_payload = {
