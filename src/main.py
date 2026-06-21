@@ -186,7 +186,7 @@ def process_document():
             "size": size,
             "content_type": content_type,
             "word_count": word_count,
-            "tags": tags,
+            "tags": ",".join(tags),
             "ocr_text_preview": ocr_text_preview,
             "process_timestamp": process_timestamp
         }
